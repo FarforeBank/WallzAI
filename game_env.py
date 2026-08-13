@@ -211,8 +211,8 @@ class QuoridorEnv(gym.Env):
         return 1
 
     def _calculate_reward(self):
-        if self.p1_pos[0] == 0: return 10.0, True 
-        if self.p2_pos[0] == 8: return 10.0, True 
+        if self.p1_pos[0] == 0: return 1.0, True 
+        if self.p2_pos[0] == 8: return 1.0, True 
 
         # Записываем новые пути в стейт среды
         p1_dist, self.p1_path_h, self.p1_path_v = bfs_get_path(self.p1_pos[0], self.p1_pos[1], 0, self.v_walls, self.h_walls)
@@ -222,7 +222,7 @@ class QuoridorEnv(gym.Env):
         # продолжала партию с dist=-1 и мусорными shaping-наградами до 400 шагов.
         # Теперь — как в tensor_env: ходивший проигрывает (-10), партия завершается.
         if p1_dist == -1 or p2_dist == -1:
-            return -10.0, True
+            return -1.0, True
 
         delta_p1 = self.p1_last_dist - p1_dist
         delta_p2 = self.p2_last_dist - p2_dist

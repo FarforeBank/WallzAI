@@ -35,9 +35,9 @@ from tensor_env import QuoridorBatchedTensorEnv
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--num-envs", type=int, default=1024,
+    p.add_argument("--num-envs", type=int, default=512,
                    help="Параллельных сред на GPU")
-    p.add_argument("--num-steps", type=int, default=128,
+    p.add_argument("--num-steps", type=int, default=64,
                    help="Переходов АГЕНТА на среду за rollout (T)")
     p.add_argument("--total-timesteps", type=int, default=50_000_000,
                    help="Лимит по raw-шагам среды (полуходы)")
@@ -49,7 +49,8 @@ def parse_args():
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.1)
-    p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument("--ent-coef-start", type=float, default=0.05, help="Начальная энтропия")
+    p.add_argument("--ent-coef-end", type=float, default=0.005, help="Конечная энтропия")
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--pool-size", type=int, default=10)
     p.add_argument("--pool-snapshot-every", type=int, default=20,
@@ -87,9 +88,10 @@ def main():
                                    num_blocks=args.num_blocks).to(device)
     opponent.eval()
 
-    # [FIX-2] Пул оппонентов — отдельный файл; в best_model.pt только модель.
-    # Загрузка устойчива к смене архитектуры (GN->BN, другой размер башни):
-    # при несовпадении ключей начинаем обучение заново, но пул сохраняем.
+    # Подготовка переменной для старта
+    start_update = 1
+
+    # Загрузка агента и пула оппонентов
     opponent_pool = []
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
@@ -97,7 +99,12 @@ def main():
             agent.load_state_dict(ckpt["model_state_dict"])
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            print("--> Загружен чекпоинт агента.")
+            
+            # ВАЖНО: Восстанавливаем шаг для расчета энтропии и LR
+            if "update" in ckpt:
+                start_update = ckpt["update"] + 1
+                
+            print(f"--> Загружен чекпоинт агента. Продолжаем с апдейта {start_update}.")
         except RuntimeError as e:
             print(f"[!] Архитектура чекпоинта не совпадает с текущей моделью —")
             print(f"    стартуем с нуля (пул оппонентов сохраним, если есть).")
@@ -105,11 +112,14 @@ def main():
         if not os.path.exists(pool_path) and ckpt.get("opponent_pool"):
             opponent_pool = ckpt["opponent_pool"]
             print("--> Пул оппонентов перенесён из чекпоинта старого формата.")
+    
     if os.path.exists(pool_path):
         opponent_pool = torch.load(pool_path, map_location="cpu")
         print(f"--> Загружен пул оппонентов ({len(opponent_pool)} снапшотов).")
+    
     if not opponent_pool:
         opponent_pool = [{k: v.detach().cpu().clone() for k, v in agent.state_dict().items()}]
+    
     # Отбрасываем снапшоты пула, несовместимые с текущей архитектурой
     model_keys = set(agent.state_dict().keys())
     opponent_pool = [sd for sd in opponent_pool if set(sd.keys()) == model_keys]
@@ -136,13 +146,6 @@ def main():
     pending_rew    = torch.zeros(B, device=device)                     # накопленная награда перехода
     pending_active = torch.zeros(B, dtype=torch.bool, device=device)   # ждёт ответа оппонента
 
-    # ------------------------------------------------------------------
-    # Гарантия полноты буфера: за 2 raw-шага каждая среда делает ровно
-    # минимум один ход агента (ходы чередуются; done->reset ставит turn=1,
-    # что только ускоряет накопление). Значит за 2*(T+1) raw-шагов у каждой
-    # среды будет >= T+1 переходов: T для обучения + 1 для bootstrap
-    # (закрывает награду перехода T-1 и даёт value для GAE).
-    # ------------------------------------------------------------------
     raw_steps = 2 * (T + 1)
     batch_size = B * T
     minibatch_size = batch_size // args.num_minibatches
@@ -151,28 +154,25 @@ def main():
 
     obs, info = envs.reset()
 
-    pbar = tqdm(total=num_updates, desc="PPO GPU-native", unit="upd", dynamic_ncols=True)
+    pbar = tqdm(total=num_updates, initial=start_update-1, desc="PPO GPU-native", unit="upd", dynamic_ncols=True)
 
-    for update in range(1, num_updates + 1):
+    for update in range(start_update, num_updates + 1):
         t0 = time.time()
 
-        # Линейный отжиг lr
+        # Линейный отжиг lr и коэффициента энтропии
         frac = 1.0 - (update - 1.0) / num_updates
+        current_ent_coef = args.ent_coef_end + (args.ent_coef_start - args.ent_coef_end) * frac
+        
         for g in optimizer.param_groups:
             g["lr"] = args.lr * frac
 
-        # Снапшот в пул + сэмплирование оппонента (reload только при смене)
-        if update % args.pool_snapshot_every == 0:
-            opponent_pool.append({k: v.detach().cpu().clone() for k, v in agent.state_dict().items()})
-            if len(opponent_pool) > args.pool_size:
-                opponent_pool.pop(0)
+        # Выбираем оппонента на текущий rollout
         opp_idx = random.randrange(len(opponent_pool))
         if opp_idx != current_opp_idx:
             opponent.load_state_dict({k: v.to(device) for k, v in opponent_pool[opp_idx].items()})
             current_opp_idx = opp_idx
 
-        # Сброс бухгалтерии rollout'а (незакрытые переходы прошлого rollout'а
-        # сознательно отбрасываются — их данные неполны)
+        # Сброс бухгалтерии rollout'а
         slot_ctr.zero_()
         pending_active.zero_()
         pending_rew.zero_()
@@ -205,14 +205,12 @@ def main():
 
             # ---- Бухгалтерия переходов агента (Игрок 1) ----
             if agent_idx.numel() > 0:
-                # 1) Предыдущий переход закрыт: ответ оппонента получен
                 has_p = pending_active[agent_idx]
                 cids = agent_idx[has_p]
                 if cids.numel() > 0:
                     rewards_b[pending_slot[cids], cids] = pending_rew[cids]
                     pending_active[cids] = False
 
-                # 2) Открываем новый переход в слоте slot_ctr
                 s = slot_ctr[agent_idx]
                 obs_b[s, agent_idx] = obs_dec[agent_idx]
                 masks_b[s, agent_idx] = mask_dec[agent_idx]
@@ -222,15 +220,13 @@ def main():
                 pending_slot[agent_idx] = s
                 pending_rew[agent_idx] = r[agent_idx]
 
-                # 3) Партия закончилась ходом агента -> закрываем немедленно
                 d_ag = dones[agent_idx]
                 dids = agent_idx[d_ag]
                 if dids.numel() > 0:
                     rewards_b[slot_ctr[dids], dids] = r[dids]
                     dones_b[slot_ctr[dids], dids] = True
-                    wins[dids] += (r[dids] > 5.0).float()
-                    losses[dids] += (r[dids] < -5.0).float()
-                    draws = finishes - wins - losses
+                    wins[dids] += (r[dids] > 0.5).float()
+                    losses[dids] += (r[dids] < -0.5).float()
                     finishes[dids] += 1.0
                 pending_active[agent_idx] = ~d_ag
                 slot_ctr[agent_idx] += 1
@@ -240,6 +236,7 @@ def main():
                 has_p = pending_active[opp_env_idx]
                 pids = opp_env_idx[has_p]
                 if pids.numel() > 0:
+                    # ВАЖНО: Фикс аннигиляции time penalty! (компенсируем -0.01 за ожидание)
                     pending_rew[pids] -= (r[pids] + 0.02)
                     d_op = dones[pids]
                     dids = pids[d_op]
@@ -247,16 +244,15 @@ def main():
                         rewards_b[pending_slot[dids], dids] = pending_rew[dids]
                         dones_b[pending_slot[dids], dids] = True
                         pending_active[dids] = False
-                        wins[dids] += (r[dids] < -5.0).float()   # оппонент получил -10
-                        losses[dids] += (r[dids] > 5.0).float()  # оппонент получил +10
+                        wins[dids] += (r[dids] < -0.5).float()   # оппонент получил < -0.5 (поражение) => мы выиграли
+                        losses[dids] += (r[dids] > 0.5).float()  # оппонент получил > 0.5 (победа) => мы проиграли
                         finishes[dids] += 1.0
 
         min_slots = int(slot_ctr.min().item())
         assert min_slots >= T + 1, f"Нарушена инварианта буфера: {min_slots} < {T + 1}"
 
         # ------------------------------------------------------------------
-        # GAE по шагам агента. dones_b[t]=1 => переход t завершил партию,
-        # бутстрэп из values_b[t+1] отрезается. Slot T — bootstrap-переход.
+        # GAE по шагам агента. dones_b[t]=1 => переход t завершил партию
         # ------------------------------------------------------------------
         with torch.no_grad():
             advantages = torch.zeros((T, B), device=device)
@@ -277,7 +273,7 @@ def main():
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         # ------------------------------------------------------------------
-        # PPO update (fp32 — backward на MPS в fp16 нестабилен)
+        # PPO update
         # ------------------------------------------------------------------
         agent.train()
         pg_loss_acc = v_loss_acc = kl_acc = 0.0
@@ -298,7 +294,8 @@ def main():
                     -b_advantages[mb] * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef),
                 ).mean()
                 v_loss = nn.functional.smooth_l1_loss(newval.reshape(-1), b_returns[mb])
-                loss = pg_loss - args.ent_coef * entropy.mean() + args.vf_coef * v_loss
+                
+                loss = pg_loss - current_ent_coef * entropy.mean() + args.vf_coef * v_loss
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -313,25 +310,34 @@ def main():
                 n_mb += 1
 
         # ------------------------------------------------------------------
-        # Логирование (одна синхронизация на rollout)
+        # Логирование и Curriculum
         # ------------------------------------------------------------------
         dt = time.time() - t0
         fps = int(steps_per_rollout / dt)
         n_fin = finishes.sum().item()
         winrate = wins.sum().item() / n_fin if n_fin > 0 else 0.0
         lossrate = losses.sum().item() / n_fin if n_fin > 0 else 0.0
-        drawrate = draws.sum().item() / n_fin if n_fin > 0 else 0.0
+        drawrate = (n_fin - wins.sum().item() - losses.sum().item()) / n_fin if n_fin > 0 else 0.0
 
         pbar.set_postfix({
             "FPS": fps,
             "Win%": f"{100.0 * winrate:.1f}",
             "Draw%": f"{100.0 * drawrate:.1f}",
             "Loss%": f"{100.0 * lossrate:.1f}",
-            "PLoss": f"{pg_loss_acc / n_mb:.4f}",
+            "Ent": f"{current_ent_coef:.4f}",
             "VLoss": f"{v_loss_acc / n_mb:.4f}",
             "KL": f"{kl_acc / n_mb:.4f}",
         })
         pbar.update(1)
+
+        # Smart Curriculum: Сохраняем в пул только если агент уверенно обыгрывает старые версии
+        if update % args.pool_snapshot_every == 0:
+            if winrate > 0.55:
+                opponent_pool.append({k: v.detach().cpu().clone() for k, v in agent.state_dict().items()})
+                if len(opponent_pool) > args.pool_size:
+                    opponent_pool.pop(0)
+            else:
+                pass # Агент еще не готов стать новым бейзлайном
 
         if update % args.save_every == 0 or update == num_updates:
             torch.save({

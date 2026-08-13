@@ -174,9 +174,9 @@ class QuoridorBatchedTensorEnv:
         # [ПАТЧ 2] Приоритет победы над тупиками
         invalid_path = ((p1_dist == 81) | (p2_dist == 81)) & ~(p1_wins | p2_wins)
 
-        rewards = torch.where(invalid_path, torch.tensor(-10.0, device=self.device), rewards)
-        rewards = torch.where(p1_wins & is_p1, torch.tensor(10.0, device=self.device), rewards)
-        rewards = torch.where(p2_wins & ~is_p1, torch.tensor(10.0, device=self.device), rewards)
+        rewards = torch.where(invalid_path, torch.tensor(-1.0, device=self.device), rewards)
+        rewards = torch.where(p1_wins & is_p1, torch.tensor(1.0, device=self.device), rewards)
+        rewards = torch.where(p2_wins & ~is_p1, torch.tensor(1.0, device=self.device), rewards)
 
         terminated = p1_wins | p2_wins | invalid_path
         truncated = self.step_count > 400
