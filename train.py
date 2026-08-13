@@ -35,9 +35,9 @@ from tensor_env import QuoridorBatchedTensorEnv
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--num-envs", type=int, default=512,
+    p.add_argument("--num-envs", type=int, default=1024,
                    help="Параллельных сред на GPU")
-    p.add_argument("--num-steps", type=int, default=64,
+    p.add_argument("--num-steps", type=int, default=128,
                    help="Переходов АГЕНТА на среду за rollout (T)")
     p.add_argument("--total-timesteps", type=int, default=50_000_000,
                    help="Лимит по raw-шагам среды (полуходы)")
@@ -230,6 +230,7 @@ def main():
                     dones_b[slot_ctr[dids], dids] = True
                     wins[dids] += (r[dids] > 5.0).float()
                     losses[dids] += (r[dids] < -5.0).float()
+                    draws = finishes - wins - losses
                     finishes[dids] += 1.0
                 pending_active[agent_idx] = ~d_ag
                 slot_ctr[agent_idx] += 1
@@ -239,7 +240,7 @@ def main():
                 has_p = pending_active[opp_env_idx]
                 pids = opp_env_idx[has_p]
                 if pids.numel() > 0:
-                    pending_rew[pids] -= r[pids]
+                    pending_rew[pids] -= (r[pids] + 0.02)
                     d_op = dones[pids]
                     dids = pids[d_op]
                     if dids.numel() > 0:
@@ -319,10 +320,12 @@ def main():
         n_fin = finishes.sum().item()
         winrate = wins.sum().item() / n_fin if n_fin > 0 else 0.0
         lossrate = losses.sum().item() / n_fin if n_fin > 0 else 0.0
+        drawrate = draws.sum().item() / n_fin if n_fin > 0 else 0.0
 
         pbar.set_postfix({
             "FPS": fps,
             "Win%": f"{100.0 * winrate:.1f}",
+            "Draw%": f"{100.0 * drawrate:.1f}",
             "Loss%": f"{100.0 * lossrate:.1f}",
             "PLoss": f"{pg_loss_acc / n_mb:.4f}",
             "VLoss": f"{v_loss_acc / n_mb:.4f}",

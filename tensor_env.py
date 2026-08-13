@@ -319,9 +319,6 @@ class QuoridorBatchedTensorEnv:
             reached = R[b2, target_r, :].any(dim=-1)
             dists[reached & ~found] = float(step)
             found |= reached
-            # Ранняя остановка с синком только раз в 8 итераций
-            if (step & 7) == 7 and bool(found.all()):
-                break
 
             # [ПАТЧ 3] Идеальный сдвиг без Shape Mismatch
             R_up = torch.roll(R, shifts=-1, dims=1)
