@@ -8,7 +8,6 @@ class QuoridorBatchedTensorEnv:
         
         self.b_idx = torch.arange(num_envs, device=self.device)
         
-        # Тензоры состояния
         self.p1_pos = torch.zeros((num_envs, 2), dtype=torch.long, device=self.device)
         self.p2_pos = torch.zeros((num_envs, 2), dtype=torch.long, device=self.device)
         self.p1_walls = torch.zeros(num_envs, dtype=torch.long, device=self.device)
@@ -24,10 +23,6 @@ class QuoridorBatchedTensorEnv:
         self.p1_last_dist = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
         self.p2_last_dist = torch.zeros(num_envs, dtype=torch.float32, device=self.device)
 
-        # [ПАТЧ 4] Перестановка каноническое <-> абсолютное действие (инволюция).
-        # Совпадает с QuoridorEnv._map_action_to_absolute: ходы 0<->1, 2<->3, 4<->7, 5<->6,
-        # стены (r, c) -> (7-r, 7-c). Для хода игрока 2 obs канонический,
-        # поэтому действия и маски тоже должны быть каноническими.
         perm = list(range(self.num_actions))
         perm[0], perm[1] = 1, 0
         perm[2], perm[3] = 3, 2
@@ -41,11 +36,6 @@ class QuoridorBatchedTensorEnv:
         self._reset_state(self.b_idx)
 
     def _reset_state(self, indices):
-        """Сброс состояния сред БЕЗ пересчёта obs/mask.
-
-        [FIX-SPEED] Раньше step() вызывал reset(), который считал _get_obs() и
-        _get_info() (дорогая маска!) для ВСЕХ сред — и выбрасывал результат.
-        """
         if indices.numel() == 0:
             return
 
@@ -59,10 +49,11 @@ class QuoridorBatchedTensorEnv:
         self.h_walls[indices] = False
         self.v_walls[indices] = False
         self.centers[indices] = False
-        self.turn[indices] = 1
+        
+        # [FIX] Рандомизация начального хода! Учит агента играть с отставанием по темпу.
+        self.turn[indices] = torch.randint(1, 3, size=(indices.numel(),), device=self.device)
         self.step_count[indices] = 0
 
-        # Flood fill только для сбрасываемых сред, а не для всех
         d1, d2 = self.batched_flood_fill(indices)
         self.p1_last_dist[indices] = d1
         self.p2_last_dist[indices] = d2
@@ -77,8 +68,6 @@ class QuoridorBatchedTensorEnv:
         self.step_count += 1
         is_p1 = (self.turn == 1)
 
-        # [ПАТЧ 4] Агент играет в канонических координатах (как в game_env):
-        # для хода игрока 2 переводим действие в абсолютное.
         actions = torch.where(is_p1, actions, self.action_perm[actions])
         
         active_pos = torch.where(is_p1.unsqueeze(1), self.p1_pos, self.p2_pos)
@@ -120,7 +109,6 @@ class QuoridorBatchedTensorEnv:
         new_c[act_ul | act_dl] -= 1
         new_c[act_ur | act_dr] += 1
         
-        # [ПАТЧ 1] Предохранитель OOB
         new_r = torch.clamp(new_r, min=0, max=8)
         new_c = torch.clamp(new_c, min=0, max=8)
         
@@ -132,9 +120,13 @@ class QuoridorBatchedTensorEnv:
         self.p2_pos = torch.where(~is_p1.unsqueeze(1), active_pos, self.p2_pos)
         
         # 3. ОБРАБОТКА УСТАНОВКИ СТЕН
-        # [FIX-SPEED] Убраны ветки `if is_h_wall.any()` / `if is_v_wall.any()` —
-        # каждая из них это синхронизация GPU->CPU на КАЖДОМ шаге. Теперь
-        # векторный masked-OR без булева индексирования (индексы b_idx уникальны).
+        # [FIX] Сохраняем состояние стен до изменений (для мягкого отката)
+        old_h = self.h_walls.clone()
+        old_v = self.v_walls.clone()
+        old_c = self.centers.clone()
+        old_p1w = self.p1_walls.clone()
+        old_p2w = self.p2_walls.clone()
+
         h_idx = torch.clamp(actions - 8, min=0, max=63)
         hr, hc = h_idx // 8, h_idx % 8
         self.h_walls[self.b_idx, hr, hc] |= is_h_wall
@@ -150,15 +142,33 @@ class QuoridorBatchedTensorEnv:
         center_c = torch.where(is_h_wall, hc, vc)
         self.centers[self.b_idx, center_r, center_c] |= is_wall_action
 
-        # Списание стен (clamp от ухода в минус)
         self.p1_walls = torch.where(is_p1 & is_wall_action, torch.clamp(self.p1_walls - 1, min=0), self.p1_walls)
         self.p2_walls = torch.where(~is_p1 & is_wall_action, torch.clamp(self.p2_walls - 1, min=0), self.p2_walls)
 
         # 4. СМЕНА ХОДА И РАСЧЕТ НАГРАДЫ
         self.turn = 3 - self.turn
 
-        # Один батч на обоих игроков вместо двух вызовов
         p1_dist, p2_dist = self.batched_flood_fill()
+        
+        p1_wins = (self.p1_pos[:, 0] == 0)
+        p2_wins = (self.p2_pos[:, 0] == 8)
+
+        # [FIX] Проверяем блокировку пути
+        invalid_path = ((p1_dist == 81) | (p2_dist == 81)) & ~(p1_wins | p2_wins) & is_wall_action
+
+        # ОТКАТЫВАЕМ СТЕНЫ НАРУШИТЕЛЯМ
+        invalid_mask_2d = invalid_path.view(-1, 1, 1)
+        self.h_walls = torch.where(invalid_mask_2d, old_h, self.h_walls)
+        self.v_walls = torch.where(invalid_mask_2d, old_v, self.v_walls)
+        self.centers = torch.where(invalid_mask_2d, old_c, self.centers)
+        self.p1_walls = torch.where(invalid_path, old_p1w, self.p1_walls)
+        self.p2_walls = torch.where(invalid_path, old_p2w, self.p2_walls)
+
+        # ПЕРЕСЧИТЫВАЕМ ДИСТАНЦИИ ДЛЯ ОТКАЧЕННЫХ СРЕД
+        if invalid_path.any():
+            d1_fixed, d2_fixed = self.batched_flood_fill(self.b_idx[invalid_path])
+            p1_dist[invalid_path] = d1_fixed
+            p2_dist[invalid_path] = d2_fixed
 
         delta_p1 = self.p1_last_dist - p1_dist
         delta_p2 = self.p2_last_dist - p2_dist
@@ -168,17 +178,12 @@ class QuoridorBatchedTensorEnv:
         self.p1_last_dist = p1_dist
         self.p2_last_dist = p2_dist
 
-        p1_wins = (self.p1_pos[:, 0] == 0)
-        p2_wins = (self.p2_pos[:, 0] == 8)
-
-        # [ПАТЧ 2] Приоритет победы над тупиками
-        invalid_path = ((p1_dist == 81) | (p2_dist == 81)) & ~(p1_wins | p2_wins)
-
-        rewards = torch.where(invalid_path, torch.tensor(-1.0, device=self.device), rewards)
+        # [FIX] Заменяем termination на мягкий штраф (-0.1) за пропуск хода
+        rewards = torch.where(invalid_path, torch.tensor(-0.1, device=self.device), rewards)
         rewards = torch.where(p1_wins & is_p1, torch.tensor(1.0, device=self.device), rewards)
         rewards = torch.where(p2_wins & ~is_p1, torch.tensor(1.0, device=self.device), rewards)
 
-        terminated = p1_wins | p2_wins | invalid_path
+        terminated = p1_wins | p2_wins
         truncated = self.step_count > 400
         dones = terminated | truncated
 
@@ -190,7 +195,6 @@ class QuoridorBatchedTensorEnv:
     def _get_obs(self):
         obs = torch.zeros((self.num_envs, 6, 9, 9), dtype=torch.float32, device=self.device)
         
-        # Заполняем как Игрок 1 (Абсолютное представление)
         obs[self.b_idx, 0, self.p1_pos[:, 0], self.p1_pos[:, 1]] = 1.0
         obs[self.b_idx, 1, self.p2_pos[:, 0], self.p2_pos[:, 1]] = 1.0
         obs[:, 2] = self.h_walls.float()
@@ -202,23 +206,14 @@ class QuoridorBatchedTensorEnv:
         if is_p2.any():
             flipped_obs = obs[is_p2].clone()
 
-            # Каналы 0-1 (пешки): точка (r, c) -> (8-r, 8-c), обычный поворот на 180°
             flipped_obs[:, 0:2] = torch.flip(flipped_obs[:, 0:2], dims=[2, 3])
 
-            # [ПАТЧ 5] Каналы стен: у сегментов маркировка НЕ центрально-симметрична.
-            # h_walls (r, c) -> (7-r, 8-c), v_walls (r, c) -> (8-r, 7-c),
-            # как в QuoridorEnv._get_obs. Голый torch.flip давал (8-r, 8-c) —
-            # смещение на клетку и рассинхрон с CPU-средой/инференсом.
             h_flip = torch.flip(self.h_walls[is_p2].float(), dims=[1, 2])
             flipped_obs[:, 2] = torch.roll(h_flip, shifts=-1, dims=1)
             v_flip = torch.flip(self.v_walls[is_p2].float(), dims=[1, 2])
             flipped_obs[:, 3] = torch.roll(v_flip, shifts=-1, dims=2)
 
-            # Меняем местами каналы:
-            # 0 (Своя позиция) <-> 1 (Позиция оппонента)
-            # 4 (Свои стены) <-> 5 (Стены оппонента)
             flipped_obs = flipped_obs[:, [1, 0, 2, 3, 5, 4], :, :]
-
             obs[is_p2] = flipped_obs
             
         return obs
@@ -276,8 +271,6 @@ class QuoridorBatchedTensorEnv:
         valid_v = ~v_overlap & has_walls.view(-1, 1, 1)
         mask[:, 72:136] = valid_v.reshape(self.num_envs, 64)
         
-        # [ПАТЧ 4] Переводим абсолютную маску в каноническую для хода игрока 2
-        # (перестановка — инволюция, действует в обе стороны), как в game_env.
         mask_canonical = mask[:, self.action_perm]
         mask = torch.where(is_p1.unsqueeze(1), mask, mask_canonical)
 
@@ -287,17 +280,12 @@ class QuoridorBatchedTensorEnv:
         return {'valid_actions_mask': mask}
 
     def batched_flood_fill(self, indices=None):
-        """BFS-расстояния до целевой горизонтали для ОБОИХ игроков одним батчем.
-
-        [FIX-SPEED] Раньше было 2 отдельных вызова (p1 и p2) с синхронизацией
-        GPU->CPU (`found.all()`) на КАЖДОЙ из до 81 итераций — это десятки
-        pipeline-stall'ов на каждый env.step. Теперь: один батч 2*K и проверка
-        раннего выхода раз в 8 итераций.
-        Возвращает (p1_dists, p2_dists) для сред indices (None = все).
-        """
         if indices is None:
             indices = self.b_idx
         K = indices.shape[0]
+        if K == 0:
+            return torch.empty(0, device=self.device), torch.empty(0, device=self.device)
+
         b2 = torch.arange(2 * K, device=self.device)
 
         pos_r = torch.cat([self.p1_pos[indices, 0], self.p2_pos[indices, 0]])
@@ -320,7 +308,6 @@ class QuoridorBatchedTensorEnv:
             dists[reached & ~found] = float(step)
             found |= reached
 
-            # [ПАТЧ 3] Идеальный сдвиг без Shape Mismatch
             R_up = torch.roll(R, shifts=-1, dims=1)
             R_up[:, -1, :] = False
             R_up = R_up & ~h_walls

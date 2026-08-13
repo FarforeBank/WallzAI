@@ -6,33 +6,26 @@ class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        # [FIX-SPEED] GroupNorm -> BatchNorm2d. GroupNorm на Apple MPS выполняется
-        # в разы медленнее (профилировка: forward batch=64 занимал ~129 мс, это
-        # главный bottleneck обучения). В eval-режиме BN — это fused pointwise
-        # scale/shift, почти бесплатно и на MPS, и на ANE (Core ML).
-        # ВАЖНО: rollout-инференс обязан быть в eval()-режиме (в train.py и
-        # evaluate.py уже так), иначе BN использовал бы batch-статистики.
-        self.gn1 = nn.BatchNorm2d(channels)
+        # [FIX] Используем InstanceNorm2d(affine=True) вместо BatchNorm2d/GroupNorm.
+        # В RL данные нестационарны, поэтому BN ломает обучение из-за running_stats.
+        # InstanceNorm нормализует каждый пример независимо, отлично оптимизирован
+        # на Apple Silicon (MPS/CoreML) и не зависит от размера батча.
+        self.in1 = nn.InstanceNorm2d(channels, affine=True)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.gn2 = nn.BatchNorm2d(channels)
+        self.in2 = nn.InstanceNorm2d(channels, affine=True)
 
     def forward(self, x):
         residual = x
-        x = torch.relu(self.gn1(self.conv1(x)))
-        x = self.gn2(self.conv2(x))
+        x = torch.relu(self.in1(self.conv1(x)))
+        x = self.in2(self.conv2(x))
         return torch.relu(x + residual)
 
 class QuoridorActorCritic(nn.Module):
     def __init__(self, in_channels=6, hidden_dim=128, num_actions=136, num_blocks=6):
         super().__init__()
-        # [FIX-SPEED] Башня уменьшена: 256ch x 8 блоков -> 128ch x 6 блоков.
-        # Профилировка MPS показала, что forward compute-bound (~1.5 GFLOP/состояние
-        # для поля 9x9 — избыточно для Quoridor). Новая конфигурация ~в 4.5 раза
-        # дешевле при достаточной ёмкости для этой игры. Старые значения можно
-        # вернуть явно: hidden_dim=256, num_blocks=8.
         self.initial = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(hidden_dim),
+            nn.InstanceNorm2d(hidden_dim, affine=True),
             nn.ReLU()
         )
         self.res_blocks = nn.ModuleList([ResBlock(hidden_dim) for _ in range(num_blocks)])
@@ -69,8 +62,7 @@ class QuoridorActorCritic(nn.Module):
 
         v = torch.relu(self.value_conv(features))
         v = torch.relu(self.value_fc1(v.reshape(v.size(0), -1)))
-        # [FIX] Без tanh: награды за победу/поражение — ±10, поэтому tanh([-1, 1])
-        # делал целевые returns физически недостижимыми для критика и взрывал value-loss.
+        # Без tanh, чтобы Value Function могла спокойно сходиться к ±10
         value = self.value_fc2(v)
         return logits, value
 
