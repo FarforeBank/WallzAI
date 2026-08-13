@@ -26,9 +26,14 @@ def get_greedy_action(agent, obs_np, mask_np, device):
     mask_t = torch.from_numpy(mask_np).unsqueeze(0).bool().to(device)
 
     with torch.no_grad():
-        with torch.autocast(device_type='mps' if device.type == 'mps' else 'cpu', dtype=torch.float16):
+        # [FIX] autocast(float16) поддерживается только на MPS; на CPU это
+        # падение/ошибка — там считаем в fp32.
+        if device.type == 'mps':
+            with torch.autocast(device_type='mps', dtype=torch.float16):
+                logits, _ = agent(obs_t, mask_t)
+        else:
             logits, _ = agent(obs_t, mask_t)
-            action = torch.argmax(logits, dim=-1).item()
+        action = torch.argmax(logits, dim=-1).item()
     return action
 
 def run_tournament(agent_a, agent_b, device, num_games=100):
@@ -99,7 +104,6 @@ def run_tournament(agent_a, agent_b, device, num_games=100):
     print(f"Ср. длина игры  : {total_steps / num_games:.1f} шагов")
     print("="*30)
 
-# Обнови инициализацию для турнира:
 if __name__ == "__main__":
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -107,12 +111,12 @@ if __name__ == "__main__":
     agent_a = load_agent("checkpoints/best_model.pt", device)
 
     print("\n=== Инициализация Агента B (Apple Neural Engine) ===")
-    # Заменяем PyTorch-инференс бота на аппаратно-ускоренный Core ML
     try:
         agent_b = QuoridorNPUInference("checkpoints/QuoridorNPU.mlpackage")
     except Exception as e:
         print(f"Ошибка загрузки NPU модели: {e}. Используем fallback PyTorch.")
-        agent_b = load_agent("quoridor_ppo_checkpoint.pt", device)
-        
-    # В функции get_greedy_action нужно добавить ветвление:
-    # если агент имеет тип QuoridorNPUInference, вызываем agent.predict_action(obs_np, mask_np)
+        # [FIX] Раньше fallback указывал на несуществующий quoridor_ppo_checkpoint.pt
+        agent_b = load_agent("checkpoints/best_model.pt", device)
+
+    # [FIX] Турнир раньше никогда не запускался — вызова не было
+    run_tournament(agent_a, agent_b, device, num_games=100)

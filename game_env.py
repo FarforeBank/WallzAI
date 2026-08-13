@@ -218,6 +218,12 @@ class QuoridorEnv(gym.Env):
         p1_dist, self.p1_path_h, self.p1_path_v = bfs_get_path(self.p1_pos[0], self.p1_pos[1], 0, self.v_walls, self.h_walls)
         p2_dist, self.p2_path_h, self.p2_path_v = bfs_get_path(self.p2_pos[0], self.p2_pos[1], 8, self.v_walls, self.h_walls)
 
+        # [FIX] Стена полностью перекрыла путь (dist == -1). Раньше среда молча
+        # продолжала партию с dist=-1 и мусорными shaping-наградами до 400 шагов.
+        # Теперь — как в tensor_env: ходивший проигрывает (-10), партия завершается.
+        if p1_dist == -1 or p2_dist == -1:
+            return -10.0, True
+
         delta_p1 = self.p1_last_dist - p1_dist
         delta_p2 = self.p2_last_dist - p2_dist
         

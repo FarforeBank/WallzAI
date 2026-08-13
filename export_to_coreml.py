@@ -11,7 +11,8 @@ def export():
     os.makedirs("checkpoints", exist_ok=True)
 
     print("Инициализация базовой модели PyTorch...")
-    base_agent = QuoridorActorCritic(in_channels=6, hidden_dim=256, num_actions=136)
+    # Архитектура по умолчанию (128ch / 6 блоков) — как в train.py
+    base_agent = QuoridorActorCritic(in_channels=6, num_actions=136)
 
     target_path = checkpoint_path if os.path.exists(checkpoint_path) else fallback_checkpoint
 
